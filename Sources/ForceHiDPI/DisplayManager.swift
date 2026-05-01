@@ -67,9 +67,37 @@ class DisplayManager {
         let vdID = CGDirectDisplayID(vd.displayID)
         log("Virtual display 0x\(String(vdID, radix: 16)) -> mirror of 0x\(String(target.displayID, radix: 16))")
 
-        // Wait briefly for the virtual display to register, then configure mirror
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+        // Wait for the virtual display to fully register before configuring mirror.
+        // The virtual display needs time to appear in the display list and for the
+        // compositor to allocate its backing store. 0.5s is often too short on M4/M5.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             guard let self else { completion(false); return }
+
+            // Verify the virtual display is actually online before proceeding
+            var count: UInt32 = 0
+            guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else {
+                lastError = "Virtual display disappeared"
+                log("error: \(lastError!)")
+                deactivate()
+                completion(false)
+                return
+            }
+            var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+            guard CGGetOnlineDisplayList(count, &ids, &count) == .success else {
+                lastError = "Failed to enumerate displays"
+                log("error: \(lastError!)")
+                deactivate()
+                completion(false)
+                return
+            }
+            let vdOnline = ids.contains(vdID)
+            if !vdOnline {
+                lastError = "Virtual display not in online list"
+                log("error: \(lastError!) — VD 0x\(String(vdID, radix: 16)) not found in \(count) displays")
+                deactivate()
+                completion(false)
+                return
+            }
 
             // Set colour space before mirror so the compositor uses the
             // correct gamut from the first composited frame
@@ -83,9 +111,16 @@ class DisplayManager {
                 return
             }
 
+            // Apply PQ gamma correction after a brief delay so the mirror is
+            // fully settled. Applying immediately causes a visible flicker
+            // as the gamma table changes mid-frame.
             if hdrMode {
                 log("  HDR mode: 16-bit compositor pipeline, PQ gamma correction to 10-bit output")
-                applyPQGammaCorrection(displayID: vdID)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    guard let self else { return }
+                    applyPQGammaCorrection(displayID: vdID)
+                    log("  Applied PQ gamma correction")
+                }
             }
 
             matchColourProfile(physicalID: target.displayID, virtualID: vdID)
@@ -234,8 +269,16 @@ class DisplayManager {
         var config: CGDisplayConfigRef?
         guard CGBeginDisplayConfiguration(&config) == .success else { return false }
         CGConfigureDisplayMirrorOfDisplay(config, target, source)
-        CGConfigureDisplayOrigin(config, source, 0, 0)
-        return CGCompleteDisplayConfiguration(config, .forSession) == .success
+        // Do NOT set origin in the same transaction as mirror — causes mirror set
+        // to silently drop off the online display list on macOS 26.4.
+        // Origin is set in a separate transaction below.
+        guard CGCompleteDisplayConfiguration(config, .forSession) == .success else { return false }
+
+        // Set virtual display origin in a separate transaction
+        var config2: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config2) == .success else { return false }
+        CGConfigureDisplayOrigin(config2, source, 0, 0)
+        return CGCompleteDisplayConfiguration(config2, .forSession) == .success
     }
 
     private func unconfigureMirror(target: CGDirectDisplayID) {
