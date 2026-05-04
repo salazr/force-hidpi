@@ -39,6 +39,8 @@ class DisplayManager {
     private(set) var targetDisplay: DisplayTarget?
     private(set) var lastError: String?
     private var hdrModeActive = false
+    /// Incremented on every reconfiguration to invalidate stale deferred gamma writes.
+    private var reconfigGeneration: Int = 0
 
     /// Activate HiDPI. Creates virtual display immediately, then calls completion
     /// on the main queue after mirror setup (non-blocking).
@@ -115,15 +117,14 @@ class DisplayManager {
             // fully settled. Applying immediately causes a visible flicker
             // as the gamma table changes mid-frame.
             if hdrMode {
+                let gen = reconfigGeneration
                 log("  HDR mode: 16-bit compositor pipeline, PQ gamma correction to 10-bit output")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                    guard let self else { return }
+                    guard let self, reconfigGeneration == gen else { return }
                     applyPQGammaCorrection(displayID: vdID)
                     log("  Applied PQ gamma correction")
                 }
             }
-
-            matchColourProfile(physicalID: target.displayID, virtualID: vdID)
 
             if isTTY {
                 printQualityInfo(label: "Virtual", displayID: vdID)
@@ -139,16 +140,17 @@ class DisplayManager {
     func rematchColourProfile() {
         guard let target = targetDisplay, let vd = virtualDisplay else { return }
         let vdID = CGDirectDisplayID(vd.displayID)
-        matchColourProfile(physicalID: target.displayID, virtualID: vdID)
 
-        // Night Shift, True Tone, and display sleep/wake can overwrite the
-        // gamma tables via CGSetDisplayTransferByTable. Re-apply PQ correction
-        // so the EOTF decode stays intact.
-        // Delay the gamma update by 200ms to let the display settle first —
-        // applying mid-frame causes visible flicker.
-        if hdrModeActive {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                guard let self else { return }
+        // Bump generation so any stale deferred gamma writes become no-ops.
+        reconfigGeneration += 1
+        let gen = reconfigGeneration
+
+        // Delay both the colour space match and gamma update to let the display
+        // settle first — applying mid-frame causes visible flicker.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self, reconfigGeneration == gen else { return }
+            matchColourProfile(physicalID: target.displayID, virtualID: vdID)
+            if hdrModeActive {
                 applyPQGammaCorrection(displayID: vdID)
                 log("  Re-applied PQ gamma correction after colour change")
             }
@@ -162,6 +164,7 @@ class DisplayManager {
         targetDisplay = nil
         lastError = nil
         hdrModeActive = false
+        reconfigGeneration = 0
         // Release the virtual display last so the mirror config transaction
         // commits before the backing display object is deallocated.
         virtualDisplay = nil
@@ -415,7 +418,7 @@ class DisplayManager {
     // MARK: - PQ gamma correction
 
     private func applyPQGammaCorrection(displayID: CGDirectDisplayID) {
-        let size: UInt32 = 256
+        let size: UInt32 = 1024
         var table = [CGGammaValue](repeating: 0, count: Int(size))
 
         // ST 2084 (PQ) EOTF constants
