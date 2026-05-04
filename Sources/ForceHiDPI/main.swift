@@ -45,6 +45,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Timestamp when activation last completed, used to ignore aftershock
     /// display-change notifications from our own reconfiguration.
     private var activationCompletedAt: Date?
+    /// Debounces display-change notifications so rapid successive events
+    /// (Night Shift, True Tone, sleep/wake, menu bar updates) coalesce
+    /// into a single reconfiguration instead of hammering the gamma LUT.
+    private var reconfigTimer: DispatchWorkItem?
 
     // Settings stored as a plist file (UserDefaults suiteName writes
     // silently fail on modern macOS for non-bundled executables).
@@ -166,6 +170,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        reconfigTimer?.cancel()
+        reconfigTimer = nil
         if let obs = displayObserver {
             NotificationCenter.default.removeObserver(obs)
         }
@@ -180,6 +186,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleProfileChange() {
         guard isActive else { return }
         manager.rematchColourProfile()
+    }
+
+    /// Debounce display-change notifications. Rapid successive events from
+    /// macOS (Night Shift, True Tone, sleep/wake, menu bar changes) would
+    /// otherwise hammer `rematchColourProfile` and cause visible flicker.
+    private func scheduleDisplayReconfiguration() {
+        reconfigTimer?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, isActive else { return }
+            // In case the user deactivated while we were waiting, bail out.
+            guard manager.findTarget() != nil else { return }
+            manager.rematchColourProfile()
+            if let target = manager.targetDisplay {
+                brightness.invalidate()
+                _ = brightness.resolve(displayID: target.displayID)
+            }
+        }
+        reconfigTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
     private func handleDisplayChange() {
@@ -197,15 +222,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 brightness.invalidate()
                 isActive = false
             } else {
-                // Display sleep/wake can reset gamma tables and colour profiles.
-                // Re-apply so PQ correction and ICC matching survive wake cycles.
-                manager.rematchColourProfile()
-                // IORegistry paths can shuffle across sleep/wake on some docks,
-                // so re-resolve the IOAVService for the (possibly new) target.
-                if let target = manager.targetDisplay {
-                    brightness.invalidate()
-                    _ = brightness.resolve(displayID: target.displayID)
-                }
+                // Debounce so rapid macOS display-change notifications coalesce
+                // into a single reconfiguration, avoiding gamma-LUT hammering.
+                scheduleDisplayReconfiguration()
             }
         }
         // Recreate the status item - display reconfiguration invalidates

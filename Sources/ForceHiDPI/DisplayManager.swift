@@ -144,9 +144,14 @@ class DisplayManager {
         // Night Shift, True Tone, and display sleep/wake can overwrite the
         // gamma tables via CGSetDisplayTransferByTable. Re-apply PQ correction
         // so the EOTF decode stays intact.
+        // Delay the gamma update by 200ms to let the display settle first —
+        // applying mid-frame causes visible flicker.
         if hdrModeActive {
-            applyPQGammaCorrection(displayID: vdID)
-            log("  Re-applied PQ gamma correction after colour change")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                guard let self else { return }
+                applyPQGammaCorrection(displayID: vdID)
+                log("  Re-applied PQ gamma correction after colour change")
+            }
         }
     }
 
