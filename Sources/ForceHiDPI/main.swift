@@ -184,8 +184,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Display change handling
 
     private func handleProfileChange() {
+        // Route through the same debounce as display changes — under memory
+        // pressure macOS can fire rapid ColorSync notifications that would
+        // otherwise stack up delayed gamma rewrites and cause flicker.
         guard isActive else { return }
-        manager.rematchColourProfile()
+        scheduleDisplayReconfiguration()
     }
 
     /// Debounce display-change notifications. Rapid successive events from
